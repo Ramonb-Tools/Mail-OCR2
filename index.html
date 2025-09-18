@@ -38,12 +38,17 @@
     .bar{height:100%;width:0%;background:linear-gradient(90deg,#46c6ff,#8ef9ff);transition:width .2s ease}
     .tiny{font-size:12px;color:var(--muted)}
     .routeCard{margin:14px 0;padding:14px;border-radius:16px;border:1px solid #1f2b55;background:#0e1733}
+    .routeTop{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
     .routeTag{display:inline-block;padding:6px 10px;border-radius:999px;font-weight:600;margin-bottom:8px}
+    .conf{font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid #2a3c7a;background:#0d1c3a;color:#b9c8ff}
     .tag-re{background:rgba(110,231,255,.15);border:1px solid #2a9bb0;color:#a9f6ff}
     .tag-dpm{background:rgba(255,215,102,.15);border:1px solid #b79a2e;color:#ffeaa1}
     .tag-shc{background:rgba(40,224,185,.15);border:1px solid #1c9e84;color:#8af1df}
     .tag-review{background:rgba(255,122,122,.15);border:1px solid #a24444;color:#ffb3b3}
     .clues{margin-top:6px;color:#a9b3c3;font-size:12px}
+    .actions{display:flex;gap:8px;margin-top:10px}
+    .actions button{padding:6px 10px;font-size:12px}
+    .threshold{margin-top:8px;font-size:12px;color:#a9b3c3}
     @media (max-width:900px){.grid{grid-template-columns:1fr}}
   </style>
 </head>
@@ -56,9 +61,20 @@
   <div class="wrap">
     <div class="panel">
       <div id="route" class="routeCard" style="display:none">
-        <div id="routeTag" class="routeTag"></div>
+        <div class="routeTop">
+          <div id="routeTag" class="routeTag"></div>
+          <div id="confBadge" class="conf" title="Confidence score based on routing clues"></div>
+        </div>
         <div id="routeWhy" class="tiny"></div>
         <div id="routeClues" class="clues"></div>
+        <div class="actions">
+          <button id="forceDPM">Force DPM</button>
+          <button id="forceRE">Force Real Estate</button>
+          <button id="forceSHC">Force SHC</button>
+          <button id="pickBtn">Use Photo</button>
+          <input id="pick" type="file" accept="image/*" capture="environment" style="display:none" />
+        </div>
+        <div class="threshold">Review cutoff: <input id="cutoff" type="number" step="0.1" min="0" max="5" value="1.4" style="width:64px" /> (raise to be stricter) — <span id="camSelWrap"></span></div>
       </div>
       <div class="grid">
         <div>
@@ -109,7 +125,6 @@
 
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <script>
-    // Register service worker (relative for GitHub Pages subfolder)
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => { navigator.serviceWorker.register('./sw.js'); });
     }
@@ -118,6 +133,8 @@
     const startBtn = document.getElementById('startCam');
     const flipBtn = document.getElementById('flipCam');
     const capBtn = document.getElementById('capture');
+    const pickBtn = document.getElementById('pickBtn');
+    const pick = document.getElementById('pick');
 
     const preview = document.getElementById('preview');
     const runBtn = document.getElementById('run');
@@ -128,16 +145,23 @@
     const statusEl = document.getElementById('status');
     const out = document.getElementById('out');
     const resSel = document.getElementById('res');
+    const cutoffInput = document.getElementById('cutoff');
+    const camSelWrap = document.getElementById('camSelWrap');
 
     const routeCard = document.getElementById('route');
     const routeTag = document.getElementById('routeTag');
     const routeWhy = document.getElementById('routeWhy');
     const routeClues = document.getElementById('routeClues');
+    const confBadge = document.getElementById('confBadge');
+    const forceDPM = document.getElementById('forceDPM');
+    const forceRE  = document.getElementById('forceRE');
+    const forceSHC = document.getElementById('forceSHC');
 
     let stream = null; let facing = 'environment';
     let capturedImage = null; // canvas
     let isRunning = false; // enforce one-at-a-time
     let log = []; // CSV log
+    let selectedDeviceId = null;
 
     function setStatus(msg){ statusEl.textContent = msg; }
     function setProgress(p){ bar.style.width = Math.min(100, Math.floor(p*100)) + '%'; }
@@ -147,18 +171,61 @@
       let width=1920,height=1080;
       if(resSel.value==='hd'){ width=1280;height=720; }
       if(resSel.value==='uhd'){ width=3840;height=2160; }
-      return { video: { facingMode: { ideal: facing }, width: { ideal: width }, height: { ideal: height } }, audio: false };
+      const base = { audio:false, video:{} };
+      if (selectedDeviceId){
+        base.video = { deviceId: { exact: selectedDeviceId }, width:{ideal:width}, height:{ideal:height} };
+      } else {
+        base.video = { facingMode: facing, width:{ideal:width}, height:{ideal:height} };
+      }
+      return base;
+    }
+
+    async function listCameras(){
+      try{
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d=>d.kind==='videoinput');
+        if(!cams.length) return;
+        const sel = document.createElement('select');
+        sel.id = 'camSel';
+        cams.forEach((c,i)=>{
+          const opt = document.createElement('option');
+          opt.value = c.deviceId;
+          opt.textContent = c.label || ('Camera ' + (i+1));
+          sel.appendChild(opt);
+        });
+        sel.addEventListener('change', ()=>{ selectedDeviceId = sel.value; startCamera(); });
+        camSelWrap.innerHTML = 'Camera: ';
+        camSelWrap.appendChild(sel);
+        if(!selectedDeviceId && cams[0]) selectedDeviceId = cams[0].deviceId;
+      }catch(e){ /* ignore */ }
     }
 
     async function startCamera(){
       try{
         if(stream){ stream.getTracks().forEach(t=>t.stop()); }
-        stream = await navigator.mediaDevices.getUserMedia(constraints());
-        video.srcObject = stream; capBtn.disabled = false; setStatus('Camera ready');
-      } catch(e){ console.error(e); setStatus('Camera error: ' + e.message); }
+        const tries = [
+          constraints(),
+          { video: { facingMode: 'environment' }, audio:false },
+          { video: true, audio:false }
+        ];
+        let lastErr = null;
+        for (const c of tries){
+          try{
+            stream = await navigator.mediaDevices.getUserMedia(c);
+            video.srcObject = stream;
+            await video.play().catch(()=>{});
+            capBtn.disabled = false; setStatus('Camera ready');
+            return;
+          }catch(e){ lastErr = e; }
+        }
+        throw lastErr || new Error('Camera not available');
+      } catch(e){ console.error(e); setStatus('Camera error: ' + e.message + ' — use “Use Photo” to pick an image instead.'); }
     }
 
-    startBtn.addEventListener('click', startCamera);
+    startBtn.addEventListener('click', async ()=>{
+      await listCameras();
+      startCamera();
+    });
     flipBtn.addEventListener('click', ()=>{ facing = (facing==='environment'?'user':'environment'); startCamera(); });
 
     capBtn.addEventListener('click', ()=>{
@@ -170,6 +237,21 @@
       ctx.drawImage(video, 0, 0, vw, vh);
       capturedImage = cnv; renderPreview(capturedImage);
       runBtn.disabled = false; setStatus('Captured. Ready to OCR');
+    });
+
+    pickBtn.addEventListener('click', ()=> pick.click());
+    pick.addEventListener('change', (e)=>{
+      const file = e.target.files && e.target.files[0];
+      if(!file) return;
+      const img = new Image();
+      img.onload = ()=>{
+        const cnv = document.createElement('canvas');
+        cnv.width = img.naturalWidth; cnv.height = img.naturalHeight;
+        cnv.getContext('2d').drawImage(img,0,0);
+        capturedImage = cnv; renderPreview(capturedImage);
+        runBtn.disabled = false; setStatus('Photo loaded. Ready to OCR');
+      };
+      img.src = URL.createObjectURL(file);
     });
 
     function renderPreview(c){
@@ -204,16 +286,16 @@
       });
     }
 
-    function showRoute(tag, why, clues){
+    function showRoute(tag, why, clues, confidence){
       routeCard.style.display='block';
       routeTag.textContent=tag.label;
       routeWhy.textContent=why;
       routeClues.textContent = clues && clues.length ? "Matched clues: " + clues.join(', ') : "";
       routeTag.className = 'routeTag ' + tag.className;
+      confBadge.textContent = 'Confidence: ' + Math.round(confidence * 100) / 100;
     }
     function hideRoute(){ routeCard.style.display='none'; }
 
-    // --- Scored Routing Rules (with clues) ---
     const RULES = {
       SHC: {
         label: 'ROUTE → SHC (MC 5536)', className:'tag-shc',
@@ -266,17 +348,17 @@
       return { best, scores, matches, confidence };
     }
 
-    function classify(text){
+    function classify(text, minConf){
       const t = (text||'').toLowerCase();
       const res = scoreRoute(t);
-      const MIN_CONF = 1.4;
+      const MIN_CONF = (typeof minConf==='number' ? minConf : 1.4);
       if (res.confidence < MIN_CONF){
-        return { tag: { label:'REVIEW & SCAN → Upload to Preliminary Notices', className:'tag-review' }, why: 'Low confidence routing — no strong ownership clues.', clues: [] };
+        return { tag: { label:'REVIEW & SCAN → Upload to Preliminary Notices', className:'tag-review' }, why: 'Low confidence routing — no strong ownership clues.', clues: [], confidence: res.confidence };
       }
       const tag = RULES[res.best];
       const clues = res.matches[res.best];
       const why = tag.why;
-      return { tag, why, clues };
+      return { tag, why, clues, confidence: res.confidence };
     }
 
     async function runOCR(){
@@ -292,14 +374,14 @@
         const { data } = await worker.recognize(img);
         await worker.terminate();
         const text=(data&&data.text)?data.text.trim():''; out.textContent=text; copyBtn.disabled=!text.length; dlBtn.disabled=!text.length;
-        const res = classify(text);
-        showRoute(res.tag, res.why, res.clues);
-        // Log to CSV
+        const cutoff = parseFloat(cutoffInput.value||'1.4');
+        const res = classify(text, cutoff);
+        showRoute(res.tag, res.why, res.clues, res.confidence);
         const ts = new Date().toISOString();
         const snippet = (text||'').replace(/\n/g,' ').slice(0,200);
         const clues = (res.clues||[]).join('; ');
-        log.push({ ts, route: res.tag.label, reason: res.why + (clues? ' | Clues: ' + clues : ''), text: snippet });
-        csvBtn.disabled = (log.length===0) ? true : false;
+        log.push({ ts, route: res.tag.label, reason: res.why + (clues? ' | Clues: ' + clues : ''), conf: String(Math.round(res.confidence*100)/100), text: snippet });
+        csvBtn.disabled = (log.length===0);
         setStatus('Done'); setProgress(1);
       } catch(e){ console.error(e); setStatus('Error – see console'); }
       finally{ isRunning=false; runBtn.disabled=false; capBtn.disabled=false; }
@@ -309,15 +391,27 @@
     copyBtn.addEventListener('click', ()=>{ if(!out.textContent) return; navigator.clipboard.writeText(out.textContent); setStatus('Copied'); });
     dlBtn.addEventListener('click', ()=>{ if(!out.textContent) return; const blob=new Blob([out.textContent],{type:'text/plain;charset=utf-8'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='ocr.txt'; a.click(); URL.revokeObjectURL(a.href); });
     csvBtn.addEventListener('click', ()=>{
-      let csv = 'Timestamp,Route,Reason,Extracted Text\n';
-      log.forEach(r=>{
-        const safe = (s)=>('"' + (s or '').replace(/"/g,'""') + '"');  // escape quotes
-      });
+      let csv = 'Timestamp,Route,Reason,Confidence,Extracted Text\n';
+      const esc = s => '"' + String(s || '').replace(/"/g,'""') + '"';
+      log.forEach(r=>{ csv += [r.ts, r.route, esc(r.reason), r.conf, esc(r.text)].join(',') + '\n'; });
+      const blob=new Blob([csv],{type:'text/csv'});
+      const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='ocr_log.csv'; a.click(); URL.revokeObjectURL(a.href);
     });
 
     if(navigator.permissions && navigator.permissions.query){
       navigator.permissions.query({name:'camera'}).then(p=>{ if(p.state==='granted') startCamera(); });
     }
+
+    function showForced(tagKey){
+      const tag = RULES[tagKey];
+      showRoute(tag, '(Manual override)', [], 999);
+      const ts = new Date().toISOString();
+      log.push({ ts, route: tag.label, reason: '(Manual override)', conf: '999', text: (out.textContent||'').replace(/\n/g,' ').slice(0,200) });
+      csvBtn.disabled = (log.length===0);
+    }
+    forceDPM.addEventListener('click', ()=>showForced('DPM'));
+    forceRE.addEventListener('click', ()=>showForced('RE'));
+    forceSHC.addEventListener('click', ()=>showForced('SHC'));
   </script>
 </body>
 </html>
